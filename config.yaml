@@ -1,0 +1,145 @@
+# ============================================================
+#  Calendar Spread Scanner — Configuration
+# ============================================================
+
+orats:
+  base_url: "https://api.orats.io/datav2"
+  rate_limit_pause: 1.1          # seconds between API calls
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7497                      # 7497=TWS paper, 7496=TWS live, 4002=GW paper, 4001=GW live
+  client_id: 10
+
+# --- Universe ---------------------------------------------------
+universe:
+# top 10 ETFs with liquid options
+  - SPY
+  - QQQ
+  - IWM
+  - XLF
+  - XLE
+  - GLD
+  - TLT
+  # - HYG
+  - EFA
+  - EEM
+# top 20 stocks by option volume
+  - TSLA
+  - AAPL
+  - NVDA
+  - AMZN
+  - AMD
+  - META
+  - MSFT
+  - GOOGL
+  - NFLX
+  - INTC
+  - BAC
+  - BABA
+  - F
+  - MU
+  - PLTR
+  - JPM
+  - C
+  - DIS
+  - COIN
+  - WFC
+
+# --- Date range for backtest ------------------------------------
+backtest:
+  start_date: "2016-01-04"
+  end_date: "2026-01-31"
+  initial_capital: 100000.0
+
+# --- Expiration selection ---------------------------------------
+expiry:
+  front_dte_min: 10              # prefer expiry closest to this
+  front_dte_max: 45
+  front_dte_target: 30
+  back_dte_min: 30
+  back_dte_max: 80
+  back_dte_target: 60
+  min_gap_days: 10                # minimum gap between front and back expiry
+  use_monthlies_only: true        # skip weeklies
+
+# --- DTE range for strike lookups (MTM only) ---
+# Only used for per-date strike fetches during backtest validation
+fetch_dte_min: 5
+fetch_dte_max: 90
+
+# --- Feature / signal parameters -------------------------------
+features:
+  signal_source: constant_maturity
+  lookback_days: 252              # rolling window for z-score and percentile
+  rv_window: 20                   # realized vol lookback (trading days)
+  min_history_days: 60            # skip ticker/date combos with < N days of history
+
+signals:
+  zscore_entry_min: 0.75          # entry when spread is >= n std devs wide vs historical mean, 0.65-0.75 showed conservative but high win % in backtest results
+  zscore_entry_max: 3.5           # above this = likely justified event risk
+  percentile_entry_min: 75        # entry when spread is in the top n% of historical values, 75% showed conservative but high win % backtest results (could try to lower)
+  # Relative-value quality filters.
+  # back_iv_percentile_max rejects entries when back IV is already elevated.
+  # rv_iv_ratio_max rejects entries when realized vol is too high vs implied.
+  back_iv_percentile_max: 70
+  rv_iv_ratio_max: 1.0
+  zscore_exit: 0.0                # exit when spread normalizes to here (0 = mean)
+  require_positive_spread: true
+  # Optional extra slope filter if you want it later:
+  # forward_minus_front_iv_max: 0.02
+
+# --- Focused grid ranges ---------------------------------------
+# Used by:
+#   python run_walk_forward.py --grid focused
+#   python run_grid_backtest.py --grid focused
+#
+# null = no filter for that scenario, even when the base config enables it.
+grid_ranges:
+  zscores: [0.50, 0.65, 0.75, 0.90]
+  percentiles: [75, 80, 90]
+  back_iv_percentiles: [70]
+  rv_iv_ratios: [1.0]
+  dte_profiles: "relaxed" # ["standard", "relaxed"], "relaxed" = standard
+  debit_caps: [0.06]
+  profit_targets: [0.10, 0.125, 0.15]
+  stop_losses: [-0.30, -0.35, -0.40]
+  max_hold_days: [30]
+  # Use [0.03] for the base robustness grid. Add 0.05 and/or 0.07 for
+  # harsher slippage runs after the base grid/walk-forward looks stable.
+  slippage_pcts: [0.03]
+
+# --- Liquidity filters ------------------------------------------
+# Using aggregate option volume from cores (not per-strike OI)
+liquidity:
+  min_stock_price: 20.0
+  min_option_volume: 5000         # total daily option volume (calls+puts)
+  min_avg_opt_volume_20d: 10000   # 20-day avg option volume from cores
+
+# --- Entry rules ------------------------------------------------
+entry:
+  max_concurrent_positions: 10
+  max_positions_per_ticker: 1
+  max_debit_pct_of_spot: 0.06     # calendar debit <= n% of underlying
+
+# --- Exit rules -------------------------------------------------
+exit:
+  profit_target_pct: 0.15         # +n% of debit, faster exits at 10-15% profit showed best results in backtests
+  stop_loss_pct: -0.30            # -30% of debit
+  time_stop_dte: 5                # exit when front leg DTE <= this
+  max_hold_days: 30               # hard exit after n days, most profit targets were reached in less than 15 days in backtests
+  min_hold_days: 10               # avoid slippage-dominated early normalization exits
+  normalization_min_pnl_pct: 0.15 # require +n% MTM before normalization exit, exits due to normalization showed negative returns in backtests. Consider removing this filter
+  spread_compression_ratio: null  # current IV spread must be <= n% of entry spread
+
+
+# --- Slippage and costs -----------------------------------------
+costs:
+  slippage_pct: 0.03              # n% of spread width on each side, 3% is a reasonable estimate for liquid SPY calendars, 5-6% is more conservative and may be needed for less liquid underlyings or wider spreads
+  commission_per_contract: 0.65
+  contracts_per_trade: 1          # legs = 2 contracts per calendar (buy+sell)
+
+# --- Position sizing --------------------------------------------
+sizing:
+  risk_per_trade_pct: 0.01       # n% of portfolio per trade (0.01 = 1%)
+  max_oi_pct: 0.05                # never exceed 5% of ATM OI
