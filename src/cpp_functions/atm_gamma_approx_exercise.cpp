@@ -37,6 +37,10 @@ double atm_gamma_approx(double spot, double iv_dec, double dte) {
         To return NaN:
             return std::numeric_limits<double>::quiet_NaN();
     */
+   if(dte <= 0 || iv_dec <=0 || spot <= 0)
+   {
+    return std::numeric_limits<double>::quiet_NaN();
+   }
 
     /*
     TODO 2:
@@ -50,6 +54,7 @@ double atm_gamma_approx(double spot, double iv_dec, double dte) {
 
         Make sure both values are doubles.
     */
+   double T = std::max(dte, 1.0) / 365.25;
 
     /*
     TODO 3:
@@ -64,7 +69,7 @@ double atm_gamma_approx(double spot, double iv_dec, double dte) {
         density at zero. For ATM options, d1 is often close to zero, so
         this is a useful quick approximation.
     */
-    return std::numeric_limits<double>::quiet_NaN();
+   return 0.3989 / (spot * iv_dec * std::sqrt(T));
 }
 
 void print_case(double spot, double iv_dec, double dte, double expected) {
