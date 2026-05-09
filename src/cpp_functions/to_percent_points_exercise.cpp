@@ -40,6 +40,9 @@ double to_percent_points(double value) {
         Use std::isfinite(value).
         If value is not finite, return it unchanged.
     */
+   if (!std::isfinite(value)) {
+        return value;
+    }
 
     /*
     TODO 2:
@@ -54,6 +57,12 @@ double to_percent_points(double value) {
     Hint:
         Use std::abs(value).
     */
+   if (std::abs(value) > 2.0) {
+        return value;
+    } else {
+        return value * 100.0;
+    }
+
     return std::numeric_limits<double>::quiet_NaN();
 }
 
@@ -71,7 +80,12 @@ std::vector<double> to_percent_points_vector(const std::vector<double>& values) 
 
         The single-value helper above should do the actual conversion.
     */
-    return {};
+   std::vector<double> output;
+   for (double value : values) {
+    output.push_back(to_percent_points(value));
+   }
+
+    return output;
 }
 
 void print_value(double value) {

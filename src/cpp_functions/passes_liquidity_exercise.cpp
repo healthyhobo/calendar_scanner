@@ -64,6 +64,9 @@ bool passes_liquidity(const LiquidityRow& row, const LiquidityConfig& cfg) {
             return false;
         }
     */
+   if (is_missing(row.stock_price) || row.stock_price < cfg.min_stock_price) {
+       return false;
+   }
 
     /*
     TODO 2:
@@ -73,6 +76,9 @@ bool passes_liquidity(const LiquidityRow& row, const LiquidityConfig& cfg) {
         Missing volume is allowed, just like the Python function.
         Use !is_missing(row.total_opt_volume).
     */
+   if (!is_missing(row.total_opt_volume) && row.total_opt_volume < cfg.min_option_volume) {
+       return false;
+   }
 
     /*
     TODO 3:
@@ -81,12 +87,15 @@ bool passes_liquidity(const LiquidityRow& row, const LiquidityConfig& cfg) {
     Hint:
         Compare avgOptVolu20d to cfg.min_avg_opt_volume_20d.
     */
+   if (!is_missing(row.avgOptVolu20d) && row.avgOptVolu20d < cfg.min_avg_opt_volume_20d) {
+       return false;
+   }
 
     /*
     TODO 4:
         If none of the rejection rules fired, return true.
     */
-    return false;
+    return true;
 }
 
 void print_case(const std::string& label, bool actual, bool expected) {

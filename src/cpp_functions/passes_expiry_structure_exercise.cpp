@@ -48,6 +48,9 @@ bool passes_expiry_structure(const ExpiryRow& row, const ExpiryConfig& cfg) {
     TODO 1:
         Reject missing front_dte.
     */
+   if (is_missing(row.front_dte)) {
+       return false;
+   }
 
     /*
     TODO 2:
@@ -59,11 +62,15 @@ bool passes_expiry_structure(const ExpiryRow& row, const ExpiryConfig& cfg) {
         C++ hint:
             double front_min = std::max(cfg.front_dte_min, 10.0);
     */
+   double front_min = std::max(cfg.front_dte_min, 10.0);
 
     /*
     TODO 3:
         Reject rows where front_dte is below front_min.
     */
+   if (row.front_dte < front_min) {
+       return false;    
+    }
 
     /*
     TODO 4:
@@ -72,6 +79,9 @@ bool passes_expiry_structure(const ExpiryRow& row, const ExpiryConfig& cfg) {
     Hint:
         if (!is_missing(cfg.front_dte_max) && row.front_dte > cfg.front_dte_max) ...
     */
+   if (!is_missing(cfg.front_dte_max) && row.front_dte > cfg.front_dte_max) {
+       return false;
+   }
 
     /*
     TODO 5:
@@ -81,12 +91,27 @@ bool passes_expiry_structure(const ExpiryRow& row, const ExpiryConfig& cfg) {
             - back max applies if configured
             - min gap applies if configured
     */
+   if (!is_missing(row.back_dte)) {
+       if (row.back_dte <= row.front_dte) {
+           return false;
+       }
+       if (row.back_dte < cfg.back_dte_min) {
+           return false;
+       }
+       if (row.back_dte > cfg.back_dte_max) {
+           return false;
+       }
+       if ((row.back_dte - row.front_dte) < cfg.min_gap_days) {
+           return false;
+       }
+    }
 
     /*
     TODO 6:
         Return true if all checks passed.
     */
-    return false;
+    return true;
+
 }
 
 void print_case(const std::string& label, bool actual, bool expected) {

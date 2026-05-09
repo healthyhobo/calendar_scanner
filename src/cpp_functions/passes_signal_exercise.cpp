@@ -50,6 +50,9 @@ bool passes_signal(const SignalRow& row, const SignalConfig& cfg) {
     TODO 1:
         Reject missing z-score or missing percentile.
     */
+   if (is_missing(row.spread_zscore) || is_missing(row.spread_pctile)) {
+        return false;
+    }
 
     /*
     TODO 2:
@@ -57,11 +60,17 @@ bool passes_signal(const SignalRow& row, const SignalConfig& cfg) {
             zscore must be >= cfg.zscore_entry_min
             zscore must be <= cfg.zscore_entry_max
     */
+   if (!(row.spread_zscore >= cfg.zscore_entry_min && row.spread_zscore <= cfg.zscore_entry_max)) {
+        return false;
+    }
 
     /*
     TODO 3:
         Apply percentile_entry_min.
     */
+    if (row.spread_pctile < cfg.percentile_entry_min) {
+        return false;
+    }
 
     /*
     TODO 4:
@@ -71,12 +80,18 @@ bool passes_signal(const SignalRow& row, const SignalConfig& cfg) {
     Hint:
         The cap is enabled when !is_missing(cfg.back_iv_percentile_max).
     */
+   if (!is_missing(cfg.back_iv_percentile_max) && !is_missing(row.back_iv_pctile) && row.back_iv_pctile > cfg.back_iv_percentile_max) {
+        return false;
+   }
 
     /*
     TODO 5:
         If rv_iv_ratio_max is enabled and row.rv_iv_ratio is present,
         reject rows where rv_iv_ratio is above the cap.
     */
+   if (!is_missing(cfg.rv_iv_ratio_max) && !is_missing(row.rv_iv_ratio) && row.rv_iv_ratio > cfg.rv_iv_ratio_max) {
+        return false;
+   }
 
     /*
     TODO 6:
@@ -87,12 +102,18 @@ bool passes_signal(const SignalRow& row, const SignalConfig& cfg) {
 
         Only apply this when calendar_debit > 0.
     */
+   if (!is_missing(cfg.max_gamma_drag_pct_of_debit) && !is_missing(row.daily_gamma_drag) && !is_missing(row.calendar_debit) && row.calendar_debit > 0) {
+        double gamma_drag_pct_of_debit = row.daily_gamma_drag / row.calendar_debit;
+        if (gamma_drag_pct_of_debit > cfg.max_gamma_drag_pct_of_debit) {
+            return false;
+        }
+    }
 
     /*
     TODO 7:
         Return true if all checks passed.
     */
-    return false;
+    return true;
 }
 
 void print_case(const std::string& label, bool actual, bool expected) {

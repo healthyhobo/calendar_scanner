@@ -17,7 +17,8 @@ the lesson focused on the exit rules rather than C++ date libraries.
 #include <optional>
 #include <string>
 
-enum class ExitReason {
+enum class ExitReason
+{
     Normalization,
     ProfitTarget,
     StopLoss,
@@ -25,32 +26,42 @@ enum class ExitReason {
     MaxHold
 };
 
-std::string to_string(ExitReason reason) {
-    switch (reason) {
-        case ExitReason::Normalization: return "normalization";
-        case ExitReason::ProfitTarget:  return "profit_target";
-        case ExitReason::StopLoss:      return "stop_loss";
-        case ExitReason::TimeStop:      return "time_stop";
-        case ExitReason::MaxHold:       return "max_hold";
+std::string to_string(ExitReason reason)
+{
+    switch (reason)
+    {
+    case ExitReason::Normalization:
+        return "normalization";
+    case ExitReason::ProfitTarget:
+        return "profit_target";
+    case ExitReason::StopLoss:
+        return "stop_loss";
+    case ExitReason::TimeStop:
+        return "time_stop";
+    case ExitReason::MaxHold:
+        return "max_hold";
     }
     return "unknown";
 }
 
-struct ExitConfig {
+struct ExitConfig
+{
     double stop_loss_pct;
     double profit_target_pct;
     int min_hold_days;
-    double spread_compression_ratio;      // NaN means disabled
+    double spread_compression_ratio; // NaN means disabled
     double normalization_min_pnl_pct;
     double time_stop_dte;
     int max_hold_days;
 };
 
-struct SignalExitConfig {
+struct SignalExitConfig
+{
     double zscore_exit;
 };
 
-struct ExitRow {
+struct ExitRow
+{
     int hold_days;
     double current_pnl_pct;
     double current_zscore;
@@ -60,15 +71,16 @@ struct ExitRow {
     double current_back_iv;
 };
 
-bool is_missing(double value) {
+bool is_missing(double value)
+{
     return std::isnan(value);
 }
 
 std::optional<ExitReason> check_exit(
-    const ExitRow& row,
-    const ExitConfig& exit_cfg,
-    const SignalExitConfig& sig_cfg
-) {
+    const ExitRow &row,
+    const ExitConfig &exit_cfg,
+    const SignalExitConfig &sig_cfg)
+{
     /*
     Python exit priority:
         1. stop loss
@@ -87,6 +99,14 @@ std::optional<ExitReason> check_exit(
         If current_pnl_pct <= stop_loss_pct, return StopLoss.
         If current_pnl_pct >= profit_target_pct, return ProfitTarget.
     */
+    if (row.current_pnl_pct <= exit_cfg.stop_loss_pct)
+    {
+        return ExitReason::StopLoss;
+    }
+    if (row.current_pnl_pct >= exit_cfg.profit_target_pct)
+    {
+        return ExitReason::ProfitTarget;
+    }
 
     /*
     TODO 2:
@@ -95,85 +115,109 @@ std::optional<ExitReason> check_exit(
         Hint:
             if (row.hold_days >= exit_cfg.min_hold_days) { ... }
     */
+    if (row.hold_days >= exit_cfg.min_hold_days)
+    {
 
-    /*
-    TODO 3:
-        Inside the min-hold block, calculate global_z_ok:
+        /*
+        TODO 3:
+            Inside the min-hold block, calculate global_z_ok:
 
-            current_zscore is present
-            and current_zscore <= zscore_exit
-    */
+                current_zscore is present
+                and current_zscore <= zscore_exit
+        */
+        bool global_z_ok = !is_missing(row.current_zscore) && row.current_zscore <= sig_cfg.zscore_exit;
 
-    /*
-    TODO 4:
-        Calculate current_spread if both front and back IV are present:
+        /*
+        TODO 4:
+            Calculate current_spread if both front and back IV are present:
 
-            current_spread = current_front_iv - current_back_iv
+                current_spread = current_front_iv - current_back_iv
 
-        If either is missing, use NaN.
-    */
+            If either is missing, use NaN.
+        */
+        double current_spread = (is_missing(row.current_front_iv) || is_missing(row.current_back_iv))
+                                    ? std::nan("")
+                                    : row.current_front_iv - row.current_back_iv;
 
-    /*
-    TODO 5:
-        Calculate spread_compressed.
+        /*
+        TODO 5:
+            Calculate spread_compressed.
 
-        If spread_compression_ratio is NaN, treat compression as true.
-        Otherwise require:
-            entry_iv_spread is present
-            current_spread is present
-            current_spread <= entry_iv_spread * spread_compression_ratio
-    */
+            If spread_compression_ratio is NaN, treat compression as true.
+            Otherwise require:
+                entry_iv_spread is present
+                current_spread is present
+                current_spread <= entry_iv_spread * spread_compression_ratio
+        */
+        bool spread_compressed = is_missing(exit_cfg.spread_compression_ratio) || (!is_missing(row.entry_iv_spread) && !is_missing(current_spread) && current_spread <= row.entry_iv_spread * exit_cfg.spread_compression_ratio);
 
-    /*
-    TODO 6:
-        If global_z_ok, spread_compressed, and current_pnl_pct is at least
-        normalization_min_pnl_pct, return Normalization.
-    */
+        /*
+        TODO 6:
+            If global_z_ok, spread_compressed, and current_pnl_pct is at least
+            normalization_min_pnl_pct, return Normalization.
+        */
+        if (global_z_ok && spread_compressed && row.current_pnl_pct >= exit_cfg.normalization_min_pnl_pct)
+        {
+            return ExitReason::Normalization;
+        }
 
-    /*
-    TODO 7:
-        Still inside the min-hold block, apply time stop:
+        /*
+        TODO 7:
+            Still inside the min-hold block, apply time stop:
 
-            if current_front_dte is present and current_front_dte < time_stop_dte,
-            return TimeStop.
-    */
-
+                if current_front_dte is present and current_front_dte < time_stop_dte,
+                return TimeStop.
+        */
+        if (!is_missing(row.current_front_dte) && row.current_front_dte < exit_cfg.time_stop_dte)
+        {
+            return ExitReason::TimeStop;
+        }
+    }
     /*
     TODO 8:
         Max hold fires after the min-hold block:
 
             if hold_days >= max_hold_days, return MaxHold.
     */
+    if (row.hold_days >= exit_cfg.max_hold_days)
+    {
+        return ExitReason::MaxHold;
+    }
 
     /*
     TODO 9:
         If no exit rule fired, return std::nullopt.
     */
+
     return std::nullopt;
 }
 
-std::string show(std::optional<ExitReason> reason) {
-    if (!reason.has_value()) {
+std::string show(std::optional<ExitReason> reason)
+{
+    if (!reason.has_value())
+    {
         return "none";
     }
     return to_string(reason.value());
 }
 
-void print_case(const std::string& label, std::optional<ExitReason> actual, const std::string& expected) {
+void print_case(const std::string &label, std::optional<ExitReason> actual, const std::string &expected)
+{
     std::cout << label << " -> actual=" << show(actual)
               << ", expected=" << expected << '\n';
 }
 
-int main() {
+int main()
+{
     const double nan = std::nan("");
     const ExitConfig exit_cfg{
-        -0.30,  // stop_loss_pct
-        0.40,   // profit_target_pct
-        3,      // min_hold_days
-        0.40,   // spread_compression_ratio
-        0.00,   // normalization_min_pnl_pct
-        5.0,    // time_stop_dte
-        30      // max_hold_days
+        -0.30, // stop_loss_pct
+        0.40,  // profit_target_pct
+        3,     // min_hold_days
+        0.40,  // spread_compression_ratio
+        0.00,  // normalization_min_pnl_pct
+        5.0,   // time_stop_dte
+        30     // max_hold_days
     };
     const SignalExitConfig sig_cfg{-0.25};
 
