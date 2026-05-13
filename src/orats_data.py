@@ -68,8 +68,21 @@ def _trade_date_bounds(path: Path) -> tuple[date, date, int] | None:
     return trade_dates.min().date(), trade_dates.max().date(), len(df)
 
 
-def _next_day(value: date) -> date:
-    return value + timedelta(days=1)
+def _next_business_day(value: date) -> date:
+    next_date = value + timedelta(days=1)
+    while next_date.weekday() >= 5:
+        next_date += timedelta(days=1)
+    return next_date
+
+
+def _business_days(start: date, end: date) -> list[date]:
+    days = []
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            days.append(current)
+        current += timedelta(days=1)
+    return days
 
 
 def _merge_history_cache(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
@@ -92,6 +105,26 @@ def _merge_history_cache(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFr
 
 def _history_range_param(start: date, end: date) -> str:
     return f"{start.isoformat()},{end.isoformat()}"
+
+
+def _fetch_history_single_dates(
+    endpoint: str,
+    ticker: str,
+    start: date,
+    end: date,
+    cfg: dict,
+) -> list[dict]:
+    """Fetch a small missing history window one trade date at a time."""
+    rows: list[dict] = []
+    days = _business_days(start, end)
+    for trade_date in days:
+        daily_rows = _orats_get(
+            cfg["orats"]["base_url"], endpoint, cfg["orats"]["token"],
+            {"ticker": ticker, "tradeDate": trade_date.isoformat()},
+            pause=cfg["orats"].get("rate_limit_pause", 1.1),
+        )
+        rows.extend(daily_rows)
+    return rows
 
 
 def cache_covers_window(path: Path, required_start=None, required_end=None) -> bool:
@@ -198,33 +231,75 @@ def fetch_summaries_history(ticker: str, cfg: dict, raw_dir: Path,
         if bounds is not None and required_end_date is not None:
             cached_start, cached_end, _ = bounds
             if cached_end < required_end_date:
-                delta_start = _next_day(cached_end)
+                delta_start = _next_business_day(cached_end)
                 logger.info(
                     "  %s summaries: fetching incremental history %s to %s",
                     ticker, delta_start, required_end_date,
                 )
-                rows = _orats_get(
-                    cfg["orats"]["base_url"], "hist/summaries", cfg["orats"]["token"],
-                    {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
-                    pause=cfg["orats"].get("rate_limit_pause", 1.1),
-                )
-                if rows:
-                    fresh = pd.DataFrame(rows)
-                    if "tradeDate" in fresh.columns:
-                        fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
-                    cached = pd.read_parquet(cache_file)
-                    merged = _merge_history_cache(cached, fresh)
-                    _safe_to_parquet(merged, cache_file)
-                    logger.info(
-                        "  %s summaries: added %d rows; cache now %d rows",
-                        ticker, len(fresh), len(merged),
+                try:
+                    rows = _orats_get(
+                        cfg["orats"]["base_url"], "hist/summaries", cfg["orats"]["token"],
+                        {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
+                        pause=cfg["orats"].get("rate_limit_pause", 1.1),
                     )
-                    return merged
-                logger.warning(
-                    "  %s summaries: incremental request returned no rows; using existing cache through %s",
-                    ticker, cached_end,
-                )
-                return pd.read_parquet(cache_file)
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status in {400, 404}:
+                        logger.warning(
+                            "  %s summaries: range request is unsupported by ORATS; fetching missing dates individually",
+                            ticker,
+                        )
+                        try:
+                            rows = _fetch_history_single_dates(
+                                "hist/summaries", ticker, delta_start, required_end_date, cfg
+                            )
+                        except requests.HTTPError as daily_exc:
+                            daily_status = daily_exc.response.status_code if daily_exc.response is not None else None
+                            if daily_status in {400, 404}:
+                                logger.warning(
+                                    "  %s summaries: single-date incremental fetch failed; falling back to full refresh",
+                                    ticker,
+                                )
+                            else:
+                                raise
+                        else:
+                            if rows:
+                                fresh = pd.DataFrame(rows)
+                                if "tradeDate" in fresh.columns:
+                                    fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                                cached = pd.read_parquet(cache_file)
+                                merged = _merge_history_cache(cached, fresh)
+                                _safe_to_parquet(merged, cache_file)
+                                logger.info(
+                                    "  %s summaries: added %d rows from individual dates; cache now %d rows",
+                                    ticker, len(fresh), len(merged),
+                                )
+                                return merged
+                            logger.warning(
+                                "  %s summaries: individual-date requests returned no rows; using existing cache through %s",
+                                ticker, cached_end,
+                            )
+                            return pd.read_parquet(cache_file)
+                    else:
+                        raise
+                else:
+                    if rows:
+                        fresh = pd.DataFrame(rows)
+                        if "tradeDate" in fresh.columns:
+                            fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                        cached = pd.read_parquet(cache_file)
+                        merged = _merge_history_cache(cached, fresh)
+                        _safe_to_parquet(merged, cache_file)
+                        logger.info(
+                            "  %s summaries: added %d rows; cache now %d rows",
+                            ticker, len(fresh), len(merged),
+                        )
+                        return merged
+                    logger.warning(
+                        "  %s summaries: incremental request returned no rows; using existing cache through %s",
+                        ticker, cached_end,
+                    )
+                    return pd.read_parquet(cache_file)
         logger.info(
             "  %s summaries: cache does not cover requested window %s to %s; refreshing full history",
             ticker, required_start, required_end,
@@ -275,33 +350,75 @@ def fetch_cores_history(ticker: str, cfg: dict, raw_dir: Path,
         if bounds is not None and required_end_date is not None:
             cached_start, cached_end, _ = bounds
             if cached_end < required_end_date:
-                delta_start = _next_day(cached_end)
+                delta_start = _next_business_day(cached_end)
                 logger.info(
                     "  %s cores: fetching incremental history %s to %s",
                     ticker, delta_start, required_end_date,
                 )
-                rows = _orats_get(
-                    cfg["orats"]["base_url"], "hist/cores", cfg["orats"]["token"],
-                    {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
-                    pause=cfg["orats"].get("rate_limit_pause", 1.1),
-                )
-                if rows:
-                    fresh = pd.DataFrame(rows)
-                    if "tradeDate" in fresh.columns:
-                        fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
-                    cached = pd.read_parquet(cache_file)
-                    merged = _merge_history_cache(cached, fresh)
-                    _safe_to_parquet(merged, cache_file)
-                    logger.info(
-                        "  %s cores: added %d rows; cache now %d rows",
-                        ticker, len(fresh), len(merged),
+                try:
+                    rows = _orats_get(
+                        cfg["orats"]["base_url"], "hist/cores", cfg["orats"]["token"],
+                        {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
+                        pause=cfg["orats"].get("rate_limit_pause", 1.1),
                     )
-                    return merged
-                logger.warning(
-                    "  %s cores: incremental request returned no rows; using existing cache through %s",
-                    ticker, cached_end,
-                )
-                return pd.read_parquet(cache_file)
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status in {400, 404}:
+                        logger.warning(
+                            "  %s cores: range request is unsupported by ORATS; fetching missing dates individually",
+                            ticker,
+                        )
+                        try:
+                            rows = _fetch_history_single_dates(
+                                "hist/cores", ticker, delta_start, required_end_date, cfg
+                            )
+                        except requests.HTTPError as daily_exc:
+                            daily_status = daily_exc.response.status_code if daily_exc.response is not None else None
+                            if daily_status in {400, 404}:
+                                logger.warning(
+                                    "  %s cores: single-date incremental fetch failed; falling back to full refresh",
+                                    ticker,
+                                )
+                            else:
+                                raise
+                        else:
+                            if rows:
+                                fresh = pd.DataFrame(rows)
+                                if "tradeDate" in fresh.columns:
+                                    fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                                cached = pd.read_parquet(cache_file)
+                                merged = _merge_history_cache(cached, fresh)
+                                _safe_to_parquet(merged, cache_file)
+                                logger.info(
+                                    "  %s cores: added %d rows from individual dates; cache now %d rows",
+                                    ticker, len(fresh), len(merged),
+                                )
+                                return merged
+                            logger.warning(
+                                "  %s cores: individual-date requests returned no rows; using existing cache through %s",
+                                ticker, cached_end,
+                            )
+                            return pd.read_parquet(cache_file)
+                    else:
+                        raise
+                else:
+                    if rows:
+                        fresh = pd.DataFrame(rows)
+                        if "tradeDate" in fresh.columns:
+                            fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                        cached = pd.read_parquet(cache_file)
+                        merged = _merge_history_cache(cached, fresh)
+                        _safe_to_parquet(merged, cache_file)
+                        logger.info(
+                            "  %s cores: added %d rows; cache now %d rows",
+                            ticker, len(fresh), len(merged),
+                        )
+                        return merged
+                    logger.warning(
+                        "  %s cores: incremental request returned no rows; using existing cache through %s",
+                        ticker, cached_end,
+                    )
+                    return pd.read_parquet(cache_file)
         logger.info(
             "  %s cores: cache does not cover requested window %s to %s; refreshing full history",
             ticker, required_start, required_end,
