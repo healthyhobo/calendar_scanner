@@ -16,7 +16,7 @@ ORATS docs: https://orats.com/docs
 import time
 import logging
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import requests
@@ -66,6 +66,32 @@ def _trade_date_bounds(path: Path) -> tuple[date, date, int] | None:
     if trade_dates.empty:
         return None
     return trade_dates.min().date(), trade_dates.max().date(), len(df)
+
+
+def _next_day(value: date) -> date:
+    return value + timedelta(days=1)
+
+
+def _merge_history_cache(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+    """Merge ORATS history rows, preferring newly fetched rows on duplicate dates."""
+    if cached.empty:
+        return fresh.copy()
+    if fresh.empty:
+        return cached.copy()
+    combined = pd.concat([cached, fresh], ignore_index=True)
+    if {"ticker", "tradeDate"}.issubset(combined.columns):
+        combined["tradeDate"] = pd.to_datetime(combined["tradeDate"], errors="coerce").dt.date
+        combined = (
+            combined
+            .drop_duplicates(subset=["ticker", "tradeDate"], keep="last")
+            .sort_values(["ticker", "tradeDate"])
+            .reset_index(drop=True)
+        )
+    return combined
+
+
+def _history_range_param(start: date, end: date) -> str:
+    return f"{start.isoformat()},{end.isoformat()}"
 
 
 def cache_covers_window(path: Path, required_start=None, required_end=None) -> bool:
@@ -164,9 +190,41 @@ def fetch_summaries_history(ticker: str, cfg: dict, raw_dir: Path,
     cache_file = raw_dir / ticker / "summaries_hist.parquet"
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     if cache_file.exists() and not force_refresh:
+        bounds = _trade_date_bounds(cache_file)
+        required_end_date = _normalize_date(required_end)
         if cache_is_usable_full_history(cache_file, required_start, required_end):
             logger.info("  %s summaries: using cached history", ticker)
             return pd.read_parquet(cache_file)
+        if bounds is not None and required_end_date is not None:
+            cached_start, cached_end, _ = bounds
+            if cached_end < required_end_date:
+                delta_start = _next_day(cached_end)
+                logger.info(
+                    "  %s summaries: fetching incremental history %s to %s",
+                    ticker, delta_start, required_end_date,
+                )
+                rows = _orats_get(
+                    cfg["orats"]["base_url"], "hist/summaries", cfg["orats"]["token"],
+                    {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
+                    pause=cfg["orats"].get("rate_limit_pause", 1.1),
+                )
+                if rows:
+                    fresh = pd.DataFrame(rows)
+                    if "tradeDate" in fresh.columns:
+                        fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                    cached = pd.read_parquet(cache_file)
+                    merged = _merge_history_cache(cached, fresh)
+                    _safe_to_parquet(merged, cache_file)
+                    logger.info(
+                        "  %s summaries: added %d rows; cache now %d rows",
+                        ticker, len(fresh), len(merged),
+                    )
+                    return merged
+                logger.warning(
+                    "  %s summaries: incremental request returned no rows; using existing cache through %s",
+                    ticker, cached_end,
+                )
+                return pd.read_parquet(cache_file)
         logger.info(
             "  %s summaries: cache does not cover requested window %s to %s; refreshing full history",
             ticker, required_start, required_end,
@@ -209,9 +267,41 @@ def fetch_cores_history(ticker: str, cfg: dict, raw_dir: Path,
     cache_file = raw_dir / ticker / "cores_hist.parquet"
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     if cache_file.exists() and not force_refresh:
+        bounds = _trade_date_bounds(cache_file)
+        required_end_date = _normalize_date(required_end)
         if cache_is_usable_full_history(cache_file, required_start, required_end):
             logger.info("  %s cores: using cached history", ticker)
             return pd.read_parquet(cache_file)
+        if bounds is not None and required_end_date is not None:
+            cached_start, cached_end, _ = bounds
+            if cached_end < required_end_date:
+                delta_start = _next_day(cached_end)
+                logger.info(
+                    "  %s cores: fetching incremental history %s to %s",
+                    ticker, delta_start, required_end_date,
+                )
+                rows = _orats_get(
+                    cfg["orats"]["base_url"], "hist/cores", cfg["orats"]["token"],
+                    {"ticker": ticker, "tradeDate": _history_range_param(delta_start, required_end_date)},
+                    pause=cfg["orats"].get("rate_limit_pause", 1.1),
+                )
+                if rows:
+                    fresh = pd.DataFrame(rows)
+                    if "tradeDate" in fresh.columns:
+                        fresh["tradeDate"] = pd.to_datetime(fresh["tradeDate"]).dt.date
+                    cached = pd.read_parquet(cache_file)
+                    merged = _merge_history_cache(cached, fresh)
+                    _safe_to_parquet(merged, cache_file)
+                    logger.info(
+                        "  %s cores: added %d rows; cache now %d rows",
+                        ticker, len(fresh), len(merged),
+                    )
+                    return merged
+                logger.warning(
+                    "  %s cores: incremental request returned no rows; using existing cache through %s",
+                    ticker, cached_end,
+                )
+                return pd.read_parquet(cache_file)
         logger.info(
             "  %s cores: cache does not cover requested window %s to %s; refreshing full history",
             ticker, required_start, required_end,

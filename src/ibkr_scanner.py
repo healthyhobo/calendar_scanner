@@ -11,12 +11,12 @@ data/results/live_signals/ with:
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import date, datetime
 import json
 import logging
 from pathlib import Path
 from typing import Any
+import asyncio
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,10 @@ from .signals import check_exit, screen_entries
 logger = logging.getLogger(__name__)
 
 try:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     from ib_insync import IB, Stock, Option
     HAS_IB = True
 except ImportError:
@@ -41,6 +45,10 @@ def _connect(cfg: dict) -> "IB":
         cfg["ibkr"]["port"],
         clientId=cfg["ibkr"]["client_id"],
     )
+    market_data_type = int(cfg.get("ibkr", {}).get("market_data_type", 2))
+    if market_data_type in {1, 2, 3, 4}:
+        ib.reqMarketDataType(market_data_type)
+        logger.info("Requested IBKR market data type %s", market_data_type)
     return ib
 
 
@@ -66,6 +74,29 @@ def _mid(bid, ask, last=np.nan, close=np.nan, market=np.nan) -> float:
     return np.nan
 
 
+def _greek_value(tick, field: str) -> float:
+    """Read a Greek from model/bid/ask/last greeks, preferring model values."""
+    model = getattr(tick, "modelGreeks", None)
+    if model is not None:
+        value = _safe_float(getattr(model, field, np.nan))
+        if np.isfinite(value):
+            return value
+
+    bid_greeks = getattr(tick, "bidGreeks", None)
+    ask_greeks = getattr(tick, "askGreeks", None)
+    bid_value = _safe_float(getattr(bid_greeks, field, np.nan)) if bid_greeks is not None else np.nan
+    ask_value = _safe_float(getattr(ask_greeks, field, np.nan)) if ask_greeks is not None else np.nan
+    if np.isfinite(bid_value) and np.isfinite(ask_value):
+        return (bid_value + ask_value) / 2.0
+    if np.isfinite(bid_value):
+        return bid_value
+    if np.isfinite(ask_value):
+        return ask_value
+
+    last_greeks = getattr(tick, "lastGreeks", None)
+    return _safe_float(getattr(last_greeks, field, np.nan)) if last_greeks is not None else np.nan
+
+
 def _dte(expiry: str | date, today: date) -> int:
     if isinstance(expiry, date):
         exp_date = expiry
@@ -74,8 +105,178 @@ def _dte(expiry: str | date, today: date) -> int:
     return (exp_date - today).days
 
 
-def _nearest(items: list[Any], target: float, key=lambda x: x):
-    return min(items, key=lambda x: abs(key(x) - target)) if items else None
+def _expiry_date(expiry: str | date) -> date:
+    if isinstance(expiry, date):
+        return expiry
+    return datetime.strptime(str(expiry), "%Y%m%d").date()
+
+
+def _is_standard_monthly_expiry(expiry: str | date) -> bool:
+    """Return True for standard US monthly option expiries.
+
+    Most expire on the third Friday. When that Friday is an exchange holiday,
+    the listed last trading date is commonly the preceding Thursday.
+    """
+    exp_date = _expiry_date(expiry)
+    return exp_date.weekday() in (3, 4) and 15 <= exp_date.day <= 21
+
+
+def _candidate_chains(chains: list[Any], ticker: str) -> list[Any]:
+    """Prefer standard SMART option chains for the underlying symbol."""
+    ticker = ticker.upper()
+
+    def score(chain) -> tuple[int, int, int, str]:
+        exchange = str(getattr(chain, "exchange", "") or "")
+        trading_class = str(getattr(chain, "tradingClass", "") or "").upper()
+        multiplier = str(getattr(chain, "multiplier", "") or "")
+        return (
+            0 if exchange == "SMART" else 1,
+            0 if trading_class in ("", ticker) else 1,
+            0 if multiplier in ("", "100") else 1,
+            trading_class,
+        )
+
+    usable = [
+        c for c in chains
+        if getattr(c, "expirations", None) and getattr(c, "strikes", None)
+    ]
+    return sorted(usable, key=score)
+
+
+def _expiry_pairs(chain: Any, cfg: dict, today: date) -> list[tuple[tuple[str, int], tuple[str, int]]]:
+    """Build front/back expiry pairs ordered by closeness to configured DTE targets."""
+    expiry_cfg = cfg.get("expiry", {})
+    front_min = int(expiry_cfg.get("front_dte_min", 10))
+    front_max = int(expiry_cfg.get("front_dte_max", 45))
+    front_target = int(expiry_cfg.get("front_dte_target", 30))
+    back_min = int(expiry_cfg.get("back_dte_min", 30))
+    back_max = int(expiry_cfg.get("back_dte_max", 80))
+    back_target = int(expiry_cfg.get("back_dte_target", 60))
+    min_gap = int(expiry_cfg.get("min_gap_days", 10))
+    monthlies_only = bool(expiry_cfg.get("use_monthlies_only", False))
+
+    expiries = []
+    for exp in sorted(chain.expirations):
+        try:
+            if monthlies_only and not _is_standard_monthly_expiry(exp):
+                continue
+            dte = _dte(exp, today)
+        except Exception:
+            continue
+        expiries.append((exp, dte))
+
+    front_choices = [(exp, dte) for exp, dte in expiries if front_min <= dte <= front_max]
+    back_choices = [(exp, dte) for exp, dte in expiries if back_min <= dte <= back_max]
+    pairs = [
+        (front, back)
+        for front in front_choices
+        for back in back_choices
+        if back[1] > front[1] and back[1] - front[1] >= min_gap
+    ]
+    pairs.sort(key=lambda p: (abs(p[0][1] - front_target) + abs(p[1][1] - back_target), p[0][1], p[1][1]))
+    return pairs
+
+
+def _make_option(ticker: str, expiry: str, strike: float, right: str, chain: Any) -> "Option":
+    opt = Option(ticker, expiry, strike, right, "SMART", currency="USD")
+    trading_class = getattr(chain, "tradingClass", None)
+    multiplier = getattr(chain, "multiplier", None)
+    if trading_class:
+        opt.tradingClass = trading_class
+    if multiplier:
+        opt.multiplier = str(multiplier)
+    return opt
+
+
+def _qualify_option(ib: "IB", ticker: str, expiry: str, strike: float, right: str, chain: Any):
+    opt = _make_option(ticker, expiry, strike, right, chain)
+    try:
+        qualified = ib.qualifyContracts(opt)
+    except Exception as exc:
+        logger.debug("%s %s %s %s qualify failed: %s", ticker, expiry, strike, right, exc)
+        return None
+    return qualified[0] if qualified else None
+
+
+def _listed_options_for_expiry(ib: "IB", ticker: str, expiry: str, right: str, chain: Any) -> dict[float, Any]:
+    """Return IBKR-listed contracts for one expiry/right keyed by strike."""
+    template = _make_option(ticker, expiry, 0.0, right, chain)
+    try:
+        details = ib.reqContractDetails(template)
+    except Exception as exc:
+        logger.debug("%s %s %s contract-details lookup failed: %s", ticker, expiry, right, exc)
+        return {}
+
+    contracts: dict[float, Any] = {}
+    for detail in details:
+        contract = getattr(detail, "contract", None)
+        if contract is None:
+            continue
+        if str(getattr(contract, "right", "")).upper() != right:
+            continue
+        if str(getattr(contract, "lastTradeDateOrContractMonth", "")) != str(expiry):
+            continue
+        strike = _safe_float(getattr(contract, "strike", np.nan))
+        if np.isfinite(strike) and strike > 0:
+            contracts[float(strike)] = contract
+    return contracts
+
+
+def _find_valid_calendar_contracts(
+    ib: "IB",
+    ticker: str,
+    chain: Any,
+    stock_price: float,
+    cfg: dict,
+    today: date,
+) -> tuple[float, tuple[str, int], tuple[str, int], list[tuple[Any, str, int, str]]] | None:
+    """
+    Find a same-strike call calendar that IBKR can actually qualify.
+
+    IBKR's option-chain strike list is not guaranteed to contain only valid
+    strike/expiry combinations. Searching nearby strikes prevents one invalid
+    nominal ATM strike from dropping the ticker.
+    """
+    strike_limit = int(cfg.get("ibkr", {}).get("strike_search_count", 12))
+    expiry_pair_limit = int(cfg.get("ibkr", {}).get("expiry_pair_search_count", 8))
+
+    pairs = _expiry_pairs(chain, cfg, today)
+    if not pairs:
+        return None
+
+    strikes = sorted(float(s) for s in chain.strikes if s and float(s) > 0)
+    strike_candidates = sorted(strikes, key=lambda s: abs(s - stock_price))[:strike_limit]
+    if not strike_candidates:
+        return None
+
+    for front, back in pairs[:expiry_pair_limit]:
+        front_calls = _listed_options_for_expiry(ib, ticker, front[0], "C", chain)
+        back_calls = _listed_options_for_expiry(ib, ticker, back[0], "C", chain)
+        common_call_strikes = set(front_calls) & set(back_calls)
+        if not common_call_strikes:
+            continue
+
+        valid_strikes = [s for s in strike_candidates if s in common_call_strikes]
+        if not valid_strikes:
+            valid_strikes = sorted(common_call_strikes, key=lambda s: abs(s - stock_price))[:strike_limit]
+        if not valid_strikes:
+            continue
+
+        strike = valid_strikes[0]
+        contracts = [
+            (front_calls[strike], front[0], front[1], "C"),
+            (back_calls[strike], back[0], back[1], "C"),
+        ]
+
+        front_puts = _listed_options_for_expiry(ib, ticker, front[0], "P", chain)
+        back_puts = _listed_options_for_expiry(ib, ticker, back[0], "P", chain)
+        if strike in front_puts:
+            contracts.append((front_puts[strike], front[0], front[1], "P"))
+        if strike in back_puts:
+            contracts.append((back_puts[strike], back[0], back[1], "P"))
+        return strike, front, back, contracts
+
+    return None
 
 
 def _get_stock_price(ib: "IB", ticker: str) -> tuple[Any, float]:
@@ -104,66 +305,23 @@ def _get_live_calendar_feature(ib: "IB", ticker: str, cfg: dict, today: date) ->
     if not chains:
         logger.warning("%s: no option chains", ticker)
         return None
-    chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
 
-    expiry_cfg = cfg.get("expiry", {})
-    front_min = int(expiry_cfg.get("front_dte_min", 10))
-    front_max = int(expiry_cfg.get("front_dte_max", 45))
-    front_target = int(expiry_cfg.get("front_dte_target", 30))
-    back_min = int(expiry_cfg.get("back_dte_min", 30))
-    back_max = int(expiry_cfg.get("back_dte_max", 80))
-    back_target = int(expiry_cfg.get("back_dte_target", 60))
-    min_gap = int(expiry_cfg.get("min_gap_days", 10))
+    calendar = None
+    selected_chain = None
+    for chain in _candidate_chains(chains, ticker):
+        calendar = _find_valid_calendar_contracts(ib, ticker, chain, stock_price, cfg, today)
+        if calendar is not None:
+            selected_chain = chain
+            break
 
-    expiries = []
-    for exp in sorted(chain.expirations):
-        try:
-            dte = _dte(exp, today)
-        except Exception:
-            continue
-        expiries.append((exp, dte))
-
-    front_choices = [(exp, dte) for exp, dte in expiries if front_min <= dte <= front_max]
-    front = _nearest(front_choices, front_target, key=lambda x: x[1])
-    if front is None:
-        logger.warning("%s: no front expiry in configured DTE range", ticker)
+    if calendar is None:
+        logger.warning("%s: no valid same-strike calendar found in configured DTE/monthly ranges", ticker)
         return None
 
-    back_choices = [
-        (exp, dte)
-        for exp, dte in expiries
-        if back_min <= dte <= back_max and dte - front[1] >= min_gap
-    ]
-    back = _nearest(back_choices, back_target, key=lambda x: x[1])
-    if back is None:
-        logger.warning("%s: no back expiry in configured DTE range", ticker)
-        return None
-
-    strikes = sorted(float(s) for s in chain.strikes if s and s > 0)
-    atm_strike = _nearest(strikes, stock_price)
-    if atm_strike is None:
-        logger.warning("%s: no strikes", ticker)
-        return None
-
+    atm_strike, front, back, contracts = calendar
     rows = []
-    contracts = []
-    for exp, dte in (front, back):
-        for right in ("C", "P"):
-            opt = Option(ticker, exp, atm_strike, right, "SMART", currency="USD")
-            try:
-                qualified = ib.qualifyContracts(opt)
-            except Exception as exc:
-                logger.debug("%s %s %s %s qualify failed: %s", ticker, exp, atm_strike, right, exc)
-                continue
-            if qualified:
-                contracts.append((qualified[0], exp, dte, right))
-
-    if not contracts:
-        return None
-
     ticks = ib.reqTickers(*[c[0] for c in contracts])
     for (contract, exp, dte, right), tick in zip(contracts, ticks):
-        greeks = tick.modelGreeks
         rows.append({
             "ticker": ticker,
             "expiry": exp,
@@ -176,11 +334,11 @@ def _get_live_calendar_feature(ib: "IB", ticker: str, cfg: dict, today: date) ->
             "close": _safe_float(tick.close),
             "market_price": _safe_float(tick.marketPrice()),
             "mid": _mid(tick.bid, tick.ask, tick.last, tick.close, tick.marketPrice()),
-            "iv": _safe_float(greeks.impliedVol) if greeks else np.nan,
-            "delta": _safe_float(greeks.delta) if greeks else np.nan,
-            "gamma": _safe_float(greeks.gamma) if greeks else np.nan,
-            "theta": _safe_float(greeks.theta) if greeks else np.nan,
-            "vega": _safe_float(greeks.vega) if greeks else np.nan,
+            "iv": _greek_value(tick, "impliedVol"),
+            "delta": _greek_value(tick, "delta"),
+            "gamma": _greek_value(tick, "gamma"),
+            "theta": _greek_value(tick, "theta"),
+            "vega": _greek_value(tick, "vega"),
         })
 
     quotes = pd.DataFrame(rows)
@@ -222,6 +380,8 @@ def _get_live_calendar_feature(ib: "IB", ticker: str, cfg: dict, today: date) ->
         "calendar_debit_proxy": debit,
         "front_call_mid": front_call_mid,
         "back_call_mid": back_call_mid,
+        "qualified_contract_count": len(contracts),
+        "trading_class": getattr(selected_chain, "tradingClass", None),
         "total_opt_volume": np.nan,
         "avgOptVolu20d": np.nan,
         "rv_20": np.nan,
@@ -420,6 +580,7 @@ def _calendar_position_recommendations(
 def run_live_scan(
     cfg: dict,
     historical_features: pd.DataFrame | None = None,
+    earnings: pd.DataFrame | None = None,
     output_dir: Path | str = Path("data/results/live_signals"),
 ) -> dict[str, pd.DataFrame | dict]:
     """Run live scan, persist snapshot files, and return all tables."""
@@ -456,8 +617,17 @@ def run_live_scan(
                 na_position="last",
             )
 
-        earnings = pd.DataFrame(columns=["ticker", "earnings_date"])
-        entry_signals = screen_entries(live_features, earnings, cfg) if not live_features.empty else pd.DataFrame()
+        earnings_df = earnings if earnings is not None else pd.DataFrame(columns=["ticker", "earnings_date"])
+        entry_required_cols = [
+            "front_iv", "back_iv", "iv_spread", "calendar_debit_bs",
+            "spread_zscore", "spread_pctile",
+        ]
+        entry_features = (
+            live_features.dropna(subset=entry_required_cols)
+            if not live_features.empty and all(c in live_features.columns for c in entry_required_cols)
+            else pd.DataFrame()
+        )
+        entry_signals = screen_entries(entry_features, earnings_df, cfg) if not entry_features.empty else pd.DataFrame()
 
         positions = _portfolio_items_to_positions(ib, cfg)
         close_signals = _calendar_position_recommendations(positions, live_features, cfg, today)
@@ -481,19 +651,31 @@ def run_live_scan(
     _safe_to_parquet(positions, output_dir / "current_positions.parquet")
     _safe_to_parquet(close_signals, output_dir / "close_signals.parquet")
 
+    universe = [str(t).upper() for t in cfg.get("universe", [])]
+    scanned_tickers = (
+        sorted(live_features["ticker"].dropna().astype(str).str.upper().unique())
+        if not live_features.empty and "ticker" in live_features.columns else []
+    )
+    missing_tickers = [ticker for ticker in universe if ticker not in set(scanned_tickers)]
+    critical_cols = ["front_iv", "back_iv", "iv_spread", "calendar_debit_bs"]
+    incomplete_rows = int(live_features[critical_cols].isna().any(axis=1).sum()) if not live_features.empty else 0
+
     snapshot = {
         "snapshot_ts": snapshot_ts,
         "snapshot_time": datetime.now().isoformat(timespec="seconds"),
         "trade_date": today.isoformat(),
-        "universe": [str(t).upper() for t in cfg.get("universe", [])],
+        "universe": universe,
         "counts": {
             "live_feature_rows": int(len(live_features)),
+            "missing_universe_tickers": int(len(missing_tickers)),
+            "incomplete_live_feature_rows": incomplete_rows,
             "entry_signal_rows": int(len(entry_signals)),
             "position_rows": int(len(positions)),
             "close_signal_rows": int(len(close_signals)),
             "close_recommendations": int((close_signals.get("recommendation", pd.Series(dtype=str)) == "CLOSE").sum())
             if not close_signals.empty else 0,
         },
+        "missing_tickers": missing_tickers,
         "files": {key: str(path) for key, path in files.items()},
         "strategy_config_snapshot": {
             "signals": cfg.get("signals", {}),
@@ -506,6 +688,7 @@ def run_live_scan(
             "Entry signals use live IBKR option quotes plus historical backtest features for z-score/percentile when provided.",
             "Close signals for existing positions are recommendations only; verify contracts and market prices before trading.",
             "Externally opened positions may not have known strategy entry date or entry IV spread, so close checks rely on available IBKR average cost, live z-score, profit/stop, and DTE.",
+            "Live contract selection searches nearby strikes and expiry pairs because IBKR strike lists can include invalid strike/expiry combinations.",
         ],
     }
     files["snapshot_json"].write_text(json.dumps(snapshot, indent=2, default=str), encoding="utf-8")

@@ -8,8 +8,9 @@ orats:
 
 ibkr:
   host: "127.0.0.1"
-  port: 7497                      # 7497=TWS paper, 7496=TWS live, 4002=GW paper, 4001=GW live
+  port: 7496                      # 7497=TWS paper, 7496=TWS live, 4002=GW paper, 4001=GW live
   client_id: 10
+  market_data_type: 2             # 1=live, 2=frozen, 3=delayed, 4=delayed frozen
 
 # --- Universe ---------------------------------------------------
 universe:
